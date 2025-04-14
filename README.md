@@ -48,4 +48,4 @@ MPU Smoothing: 10-sample moving average + angle snapping to predefined positions
     Upload the .ino sketch to your board. Open serial monitor at 9600 baud for debug logs. Attach electrodes properly for best EMG signal.
 
 👏 Credits
-    Some filtering logic and gesture inspiration from UpsideDownLabs BioAmp-EXG-Pill
+    Some filtering logic and gesture inspiration from [UpsideDownLabs BioAmp-EXG-Pill](https://github.com/upsidedownlabs/BioAmp-EXG-Pill)
