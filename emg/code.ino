@@ -1,225 +1,232 @@
 //some parts of this code are inspired by  https://github.com/upsidedownlabs/BioAmp-EXG-Pill  
-#include <Servo.h>
-#define NUM_SERVOS 5
-#define SERVO_PIN_1 3//thumb
+#if defined(ESP32) 
+  #include <ESP32Servo.h>
+#else
+  #include <Servo.h>
+#endif
+
+#include <Wire.h>
+
+// === SERVO PINS ===
+#define NUM_FINGER_SERVOS 5
+#define SERVO_PIN_1 3   // thumb
 #define SERVO_PIN_2 5
 #define SERVO_PIN_3 6
 #define SERVO_PIN_4 9
-#define SERVO_PIN_5 10//pinky
+#define SERVO_PIN_5 10  // pinky
+#define WRIST_SERVO_PIN 11
+const int numDiscreteAngles = 3;
+int discreteAngles[numDiscreteAngles] = {45,135,180};
 
-Servo servos[NUM_SERVOS];
-#define WINDOW_DURATION 200 // Window duration in milliseconds
-#define NUM_SAMPLES 100 
-float emgBuffer[NUM_SAMPLES]; 
-unsigned long startTime = 0;  // Time window start
-unsigned long lastSampleTime = 0; // Time of the last sample
-unsigned long sampleInterval;
-int sampleCount = 0;   
-float Q = 0.006;  // Process noise covariance
-float R = 1;     // Measurement noise covariance
-float x = 0;     // Initial state estimate
-float P = 1;     // Initial estimate covariance
-float K = 0;  
+Servo fingerServos[NUM_FINGER_SERVOS];
+Servo wristServo;
+
+// === EMG PARAMETERS ===
+#define WINDOW_DURATION 200
+#define NUM_SAMPLES 100
 #define SAMPLE_RATE 500
 #define BAUD_RATE 9600
 #define INPUT_PIN A0
 #define BUFFER_SIZE 128
-
 #define EMG_MIN 2
 #define EMG_MAX 10
 
+float emgBuffer[NUM_SAMPLES]; 
+unsigned long sampleInterval;
 int circular_buffer[BUFFER_SIZE];
 int data_index, sum;
-int ans[4]={150,2000,1050,500};
-Servo servo;
+int sampleCount = 0;
 
+float Q = 0.006, R = 1, x = 0, P = 1, K = 0;
+int gestureThresholds[4] = {150, 2000, 1050, 500}; // open, close, yoyo, victory
 
-// Envelop detection algorithm
-int getEnvelop(int abs_emg){
+// === MPU6050 PARAMETERS ===
+const int MPU_ADDR = 0x68;
+int16_t accZ;
+float angle;
+const int sampleCountMPU = 10;
+float angleBuffer[sampleCountMPU];
+int bufferIndex = 0;
+unsigned long lastSampleTimeMPU = 0;
+
+// === EMG FUNCTIONS ===
+int getEnvelop(int abs_emg) {
   sum -= circular_buffer[data_index];
   sum += abs_emg;
   circular_buffer[data_index] = abs_emg;
   data_index = (data_index + 1) % BUFFER_SIZE;
-  return (sum/BUFFER_SIZE) * 2;
+  return (sum / BUFFER_SIZE) * 2;
 }
 
-// Band-Pass Butterworth IIR digital filter, generated using filter_gen.py.
-// Sampling rate: 500.0 Hz, frequency: [74.5, 149.5] Hz.
-// Filter is order 4, implemented as second-order sections (biquads).
-// Reference: 
-// https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.butter.html
-// https://courses.ideate.cmu.edu/16-223/f2020/Arduino/FilterDemos/filter_gen.py
-float EMGFilter(float input)
-{
+float EMGFilter(float input) {
   float output = input;
   {
-    static float z1, z2; // filter section state
-    float x = output - 0.05159732*z1 - 0.36347401*z2;
-    output = 0.01856301*x + 0.03712602*z1 + 0.01856301*z2;
+    static float z1, z2;
+    float x = output - 0.05159732 * z1 - 0.36347401 * z2;
+    output = 0.01856301 * x + 0.03712602 * z1 + 0.01856301 * z2;
     z2 = z1;
     z1 = x;
   }
   {
-    static float z1, z2; // filter section state
-    float x = output - -0.53945795*z1 - 0.39764934*z2;
-    output = 1.00000000*x + -2.00000000*z1 + 1.00000000*z2;
+    static float z1, z2;
+    float x = output - -0.53945795 * z1 - 0.39764934 * z2;
+    output = 1.00000000 * x + -2.00000000 * z1 + 1.00000000 * z2;
     z2 = z1;
     z1 = x;
   }
   {
-    static float z1, z2; // filter section state
-    float x = output - 0.47319594*z1 - 0.70744137*z2;
-    output = 1.00000000*x + 2.00000000*z1 + 1.00000000*z2;
+    static float z1, z2;
+    float x = output - 0.47319594 * z1 - 0.70744137 * z2;
+    output = 1.00000000 * x + 2.00000000 * z1 + 1.00000000 * z2;
     z2 = z1;
     z1 = x;
   }
   {
-    static float z1, z2; // filter section state
-    float x = output - -1.00211112*z1 - 0.74520226*z2;
-    output = 1.00000000*x + -2.00000000*z1 + 1.00000000*z2;
+    static float z1, z2;
+    float x = output - -1.00211112 * z1 - 0.74520226 * z2;
+    output = 1.00000000 * x + -2.00000000 * z1 + 1.00000000 * z2;
     z2 = z1;
     z1 = x;
   }
   return output;
 }
-void setup() {
-  // Serial connection begin
-  Serial.begin(BAUD_RATE);
-  servos[0].attach(SERVO_PIN_1);
-  servos[1].attach(SERVO_PIN_2);
-  servos[2].attach(SERVO_PIN_3);
-  servos[3].attach(SERVO_PIN_4);
-  servos[4].attach(SERVO_PIN_5);
-  // Attach servo
- 
-  sampleInterval = WINDOW_DURATION / NUM_SAMPLES; // Calculate interval (in ms)
-  startTime = millis();         // Initialize the window start time
-  lastSampleTime = millis();
+
+// === MPU FUNCTIONS ===
+int16_t readAccZ() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3F); // ACCEL_ZOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  return Wire.read() << 8 | Wire.read();
 }
 
+// === SETUP ===
+void setup() {
+  Serial.begin(BAUD_RATE);
+  Wire.begin();
+
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  for (int i = 0; i < NUM_FINGER_SERVOS; i++) {
+    fingerServos[i].attach(SERVO_PIN_1 + 2 * i); // spacing by pin number
+  }
+
+  wristServo.attach(WRIST_SERVO_PIN);
+  sampleInterval = WINDOW_DURATION / NUM_SAMPLES;
+}
+
+// === MAIN LOOP ===
 void loop() {
-  // Calculate elapsed time
-    // Get current time
-  unsigned long currentMillis = millis();
-  // Add new sample to buffer at regular intervals
-  while (sampleCount<NUM_SAMPLES) {
-    // Read the EMG sensor value
-    startTime=millis();
-    static unsigned long past = 0;
-    unsigned long present = micros();
-    unsigned long interval = present - past;
-    past = present;
-  
-    // Run timer
-    static long timer = 0;
-    timer -= interval;
-  
-    // Sample and get envelop
-    if(timer < 0) {
-      timer += 1000000 / SAMPLE_RATE;
-      int sensor_value = analogRead(INPUT_PIN);
-      float signal = EMGFilter(sensor_value);
-      int envelop = getEnvelop(abs(signal));
-      int servo_position = map(envelop, EMG_MIN, EMG_MAX, 0, 180);
-      float x_pred = x;
-      float P_pred = P + Q;
-  
-    // Update
-      K = P_pred / (P_pred + R);
-      x = x_pred + K * (servo_position - x_pred);
-      P = (1 - K) * P_pred;
-     // servo.write(servo_position);
-      
-      Serial.println(x);
-//      Serial.print(",");
-//      Serial.println(servo_position);
+  handleMPU();
+  handleEMG();
+}
+
+// === HANDLE MPU SERVO ===
+void handleMPU() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastSampleTimeMPU >= 100) {
+    lastSampleTimeMPU = currentTime;
+
+    accZ = readAccZ();
+    angle = (float)(accZ - 14000) * 180.0 / (-18000 - 14000);
+    angle = constrain(angle, 0, 180);
+
+    angleBuffer[bufferIndex++] = angle;
+
+    if (bufferIndex >= sampleCountMPU) {
+      float sum = 0;
+      for (int i = 0; i < sampleCountMPU; i++) sum += angleBuffer[i];
+      float meanAngle = sum / sampleCountMPU;
+
+      // === Snap to closest predefined angle ===
+      int closestAngle = discreteAngles[0];
+      int minDiff = abs(meanAngle - discreteAngles[0]);
+      for (int i = 1; i < numDiscreteAngles; i++) {
+        int diff = abs(meanAngle - discreteAngles[i]);
+        if (diff < minDiff) {
+          minDiff = diff;
+          closestAngle = discreteAngles[i];
+        }
+      }
+      Serial.println(meanAngle);
      
-//      float emgValue=x;
-//  
-//      // Add the value to the buffer
-//      if (sampleCount < NUM_SAMPLES) {
-//        emgBuffer[sampleCount++] = emgValue;
-//      }
-//      if(millis()-startTime<20){
-//          delay(millis()-startTime);
-//        }
-//  
-//       // Update the last sample time
-//    }
-//  }
-//  
-//    // Once the 200 ms window is over, calculate the mean
-//    
-//      // Calculate the mean of the samples
-//      float sum1 = 0;
-//      for (int i = 0; i < sampleCount; i++) {
-//        sum1 += emgBuffer[i];
-//      }
-//      float mean1 = sum1 / sampleCount;
-//  
-//      // Print the mean value
-//      Serial.print("Mean EMG over 200 ms: ");
-//      Serial.println(mean1);
-      int close=2000,index1=0;
-      int mean1=x;
-      for(int t=0;t<4;t++){
-          if(abs(ans[t]-mean1)<close){
-              close=abs(ans[t]-mean1);
-              index1=t;
-            }
-        }
-       Serial.println(index1);
-      switch(index1){
-        case 3:
-          servos[0].write(150); // Set to 90° (example position)
-          servos[1].write(180);  // Reset others
-          servos[2].write(180);
-          servos[3].write(0);
-          servos[4].write(150);
-          Serial.println("victory");
-          break;
-        case 0:
-          servos[0].write(0); // Set to 90° (example position)
-          servos[1].write(180);  // Reset others
-          servos[2].write(180);
-          servos[3].write(180);
-          servos[4].write(0);
-          Serial.println("open");
-          break;
-        case 1:
-          servos[0].write(150); // Set to 90° (example position)
-          servos[1].write(0);  // Reset others
-          servos[2].write(0);
-          servos[3].write(0);
-          servos[4].write(130);
-          Serial.println("close");
-          break;
-        case 2:
-          servos[0].write(0); // Set to 90° (example position)
-          servos[1].write(180);  // Reset others
-          servos[2].write(0);
-          servos[3].write(0);
-          servos[4].write(0);
-          Serial.println("yoyo");
-          break;
-        default:
-          servos[0].write(0); // Set to 90° (example position)
-          servos[1].write(180);  // Reset others
-          servos[2].write(180);
-          servos[3].write(180);
-          servos[4].write(0);
-          break;
-        }
-  
-      // Reset for the next window
-     // memset(emgBuffer, 0, sizeof(emgBuffer)); 
-      sampleCount = 0;
-      startTime = millis();         // Reset the window start time
-    
-  
-    // Optional: Small delay for stability
-    //delay(1000);
-    
+      wristServo.write(closestAngle);
+      bufferIndex = 0;
     }
+  }
+}
+
+
+// === HANDLE EMG TO FINGER CONTROL ===
+void handleEMG() {
+  static unsigned long pastMicros = 0;
+  unsigned long nowMicros = micros();
+  unsigned long interval = nowMicros - pastMicros;
+  pastMicros = nowMicros;
+
+  static long timer = 0;
+  timer -= interval;
+
+  if (timer < 0) {
+    timer += 1000000 / SAMPLE_RATE;
+    int sensor_value = analogRead(INPUT_PIN);
+    float signal = EMGFilter(sensor_value);
+    int envelop = getEnvelop(abs(signal));
+    int servo_position = map(envelop, EMG_MIN, EMG_MAX, 0, 180);
+
+    float x_pred = x;
+    float P_pred = P + Q;
+
+    K = P_pred / (P_pred + R);
+    x = x_pred + K * (servo_position - x_pred);
+    P = (1 - K) * P_pred;
+
+    int meanEMG = x;
+    int closest = 2000, gestureIndex = 0;
+    for (int t = 0; t < 4; t++) {
+      int diff = abs(gestureThresholds[t] - meanEMG);
+      if (diff < closest) {
+        closest = diff;
+        gestureIndex = t;
+      }
+    }
+
+    switch (gestureIndex) {
+      case 0: // open
+        fingerServos[0].write(0);
+        fingerServos[1].write(180);
+        fingerServos[2].write(180);
+        fingerServos[3].write(180);
+        fingerServos[4].write(0);
+        break;
+      case 1: // close
+        fingerServos[0].write(150);
+        fingerServos[1].write(0);
+        fingerServos[2].write(0);
+        fingerServos[3].write(0);
+        fingerServos[4].write(130);
+        break;
+      case 2: // yoyo
+        fingerServos[0].write(0);
+        fingerServos[1].write(180);
+        fingerServos[2].write(0);
+        fingerServos[3].write(0);
+        fingerServos[4].write(0);
+        break;
+      case 3: // victory
+        fingerServos[0].write(150);
+        fingerServos[1].write(180);
+        fingerServos[2].write(180);
+        fingerServos[3].write(0);
+        fingerServos[4].write(150);
+        break;
+    }
+
+    Serial.print("Gesture Index: ");
+    Serial.println(gestureIndex);
   }
 }
